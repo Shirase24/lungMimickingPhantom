@@ -99,11 +99,11 @@ function LABEL = defaultLabels()
 end
 
 function [labels, lungs] = buildLabelMap(cfg, LABEL)
-%BUILDLABELMAP Construct coronal-view tissue labels and lung mask.
-%   The geometry is described analytically to avoid raster loops.  Shoulders,
-%   chest wall, mediastinum, lungs, heart, and skeletal features are all
-%   procedurally modelled using level-sets, keeping the output deterministic
-%   for a given image size.
+%BUILDLABELMAP Construct a simplified coronal tissue layout and lung mask.
+%   The phantom is intentionally coarse: fat outlines the torso, an inner
+%   muscular band surrounds the thoracic cavity, and the lungs/heart are
+%   captured with broad ellipses.  The reduced feature set keeps runtimes
+%   low while remaining deterministic for a given image size.
     H = cfg.H; W = cfg.W;
 
     % Normalized coordinate system (-1 .. 1) centered in the thorax
@@ -113,79 +113,38 @@ function [labels, lungs] = buildLabelMap(cfg, LABEL)
 
     labels = uint8(zeros(H, W) + LABEL.AIR);
 
-    % Body contour with soft shoulders to mimic a coronal (front) view
-    torso = ((x/0.94).^2 + ((y+0.02)/1.08).^2) <= 1;
-    shoulders = (((x/1.05).^4 + ((y+0.78)/0.40).^4) <= 1) & (y < -0.55);
-    bodyOuter = torso | shoulders;
-    labels(bodyOuter) = LABEL.FAT;
+    % Soft-shouldered torso outline (fat layer)
+    torso = ((x/0.95).^2 + ((y+0.05)/1.05).^2) <= 1;
+    shoulderBlend = (((x/1.05).^4 + ((y+0.75)/0.50).^4) <= 1) & (y < -0.55);
+    body = torso | shoulderBlend;
+    labels(body) = LABEL.FAT;
 
-    % Chest wall musculature encircling the thoracic cavity
-    thoraxOuter = ((x/0.80).^2 + ((y+0.02)/0.96).^2) <= 1;
-    thoraxInner = ((x/0.62).^2 + ((y+0.02)/0.84).^2) <= 1;
-    chestWall = (thoraxOuter & bodyOuter) & ~thoraxInner;
-    labels(chestWall) = LABEL.MUSCLE;
+    % Uniform muscular shell
+    thoraxOuter = ((x/0.82).^2 + ((y+0.02)/0.95).^2) <= 1;
+    thoraxInner = ((x/0.60).^2 + ((y+0.02)/0.78).^2) <= 1;
+    muscleBand = (thoraxOuter & body) & ~thoraxInner;
+    labels(muscleBand) = LABEL.MUSCLE;
 
-    % Pectoral muscle flare near the shoulders
-    pectoral = (abs(y + 0.55) <= 0.12) & (abs(x) <= 0.72) & (y < -0.40) & bodyOuter;
-    labels(pectoral) = LABEL.MUSCLE;
-
-    % Mediastinum separating lungs in the frontal plane
-    mediastinum = ((x/0.24).^2 + ((y+0.05)/0.90).^2) <= 1 & (y < 0.60);
-    labels(mediastinum) = LABEL.MUSCLE;
-
-    % Central sternum (instead of posterior spine for front view)
-    sternum = (abs(x) <= 0.045) & (y > -0.48) & (y < 0.38);
+    % Simple sternum / anterior bone strip
+    sternum = body & (abs(x) <= 0.05) & (y > -0.50) & (y < 0.55);
     labels(sternum) = LABEL.BONE;
 
-    % Clavicles arching above the lungs
-    clavLeft  = (((x+0.42)/0.24).^2 + ((y+0.66)/0.08).^2) <= 1 & (y < -0.52);
-    clavRight = (((x-0.42)/0.24).^2 + ((y+0.66)/0.08).^2) <= 1 & (y < -0.52);
-    labels(clavLeft | clavRight) = LABEL.BONE;
+    % Dome-like diaphragm used to taper the lungs
+    diaphragm = 0.50 + 0.06 * (1 - cos(pi * x));
 
-    % Anterior ribs rendered as horizontal bands curving away from the sternum
-    ribHeights = reshape(linspace(-0.20, 0.58, 7), 1, 1, []);
-    ribBand = abs(y - ribHeights) <= 0.025;
-    ribOuter = ((x/0.88).^2 + ((y - ribHeights)/0.16).^2) <= 1;
-    ribInner = ((x/0.58).^2 + ((y - ribHeights)/0.12).^2) >= 1;
-    ribs = any(ribBand & ribOuter & ribInner, 3) & bodyOuter & (abs(x) >= 0.12);
-    ribs = ribs & (y < 0.70) & (y > -0.40);
-    labels(ribs) = LABEL.BONE;
+    % Broad lung ellipses with light medial clearance
+    leftLung = (((x + 0.30)/0.40).^2 + ((y+0.05)/0.80).^2) <= 1;
+    rightLung = (((x - 0.28)/0.44).^2 + ((y+0.02)/0.82).^2) <= 1;
+    hilumGap = (abs(x) <= 0.08) & (y > -0.25) & (y < 0.35);
+    lungMask = (leftLung | rightLung) & ~hilumGap & (y <= diaphragm) & body;
+    labels(lungMask) = LABEL.LUNG;
 
-    % Trachea and central airway (air column)
-    trachea = (abs(x+0.02) <= 0.045) & (y < -0.58) & (y > -0.98);
-    labels(trachea) = LABEL.AIR;
-
-    % Diaphragm dome (higher medially, lower laterally)
-    diaphragm = 0.48 + 0.07*(1 - cos(pi*x));
-
-    % Height-dependent lung tapers for a realistic coronal silhouette
-    yFrac = min(max((y + 0.95) / 1.70, 0), 1);
-    leftWidth  = 0.46 - 0.22*yFrac;
-    rightWidth = 0.50 - 0.20*yFrac;
-
-    lungL = (y > -0.95) & (y < 0.62) & (abs(x + 0.34) <= leftWidth);
-    lungL = lungL & (((x+0.32)/0.52).^2 + ((y+0.04)/0.92).^2 <= 1.05);
-    lungL = lungL & (y <= diaphragm);
-
-    lungR = (y > -0.95) & (y < 0.62) & (abs(x - 0.30) <= rightWidth);
-    lungR = lungR & (((x-0.28)/0.56).^2 + ((y+0.02)/0.96).^2 <= 1.05);
-    lungR = lungR & (y <= diaphragm + 0.03);
-
-    % Hilum clearances adjacent to the mediastinum
-    hilum = (abs(x) <= 0.08) & (y > -0.28) & (y < 0.32);
-    lungL = lungL & ~hilum;
-    lungR = lungR & ~hilum;
-
-    lungs = (lungL | lungR) & bodyOuter;
-    labels(lungs) = LABEL.LUNG;
-
-    % Heart silhouette seen through the anterior chest (overlaps left lung)
-    heartMain = (((x-0.02)/0.26).^2 + ((y+0.04)/0.34).^2) <= 1 & (y < 0.48);
-    heartPoint = (abs(x-0.06) + 0.55*(y-0.08)) <= 0.40 & (y >= -0.10) & (y <= 0.55);
-    heart = (heartMain | heartPoint) & bodyOuter & (y > -0.30);
+    % Elliptical heart partially overlapping the left lung
+    heart = (((x - 0.05)/0.22).^2 + ((y+0.05)/0.32).^2) <= 1;
+    heart = heart & body & (y > -0.25) & (y < 0.45);
     labels(heart) = LABEL.HEART;
 
-    % Remove non-lung tissues from the lung mask
+    % Final lung mask excludes heart/other tissues
     lungs = (labels == LABEL.LUNG);
 end
 
@@ -264,7 +223,7 @@ function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
         turboMap = getTurboFallback(256);
     end
 
-    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone/Ribs/Sternum'};
+    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone/Sternum'};
     labColors = [0.90 0.90 0.90;  % air
                  1.00 0.89 0.65;  % fat
                  0.80 0.10 0.10;  % muscle
