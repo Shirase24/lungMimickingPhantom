@@ -84,82 +84,21 @@ end
 %% ======================= CORE FUNCTIONS =======================
 
 function [labels, lungs] = buildLabelMap(cfg, LABEL)
-    H = cfg.H; W = cfg.W;
+    H=cfg.H; W=cfg.W;
+    [dx,dy]=meshgrid(1:W,1:H); cx=W/2; cy=H/2;
+    E=@(xc,yc,a,b) (((dx-xc)./a).^2 + ((dy-yc)./b).^2) <= 1;
 
-    % Normalized coordinate system (-1 .. 1) centered in the thorax
-    [xIdx, yIdx] = meshgrid(1:W, 1:H);
-    x = (xIdx - (W+1)/2) / (W/2);
-    y = (yIdx - (H+1)/2) / (H/2);
+    labels = uint8(zeros(H,W) + LABEL.AIR);
+    labels(E(cx,cy,0.35*W,0.45*H)) = LABEL.FAT;      % subcutaneous fat
+    labels(E(cx,cy,0.33*W,0.42*H)) = LABEL.MUSCLE;   % muscle shell
 
-    labels = uint8(zeros(H, W) + LABEL.AIR);
-
-    % Body contour and subcutaneous fat layer (elliptical torso)
-    bodyOuter = ((x/0.95).^2 + ((y+0.05)/1.05).^2) <= 1;
-    labels(bodyOuter) = LABEL.FAT;
-
-    % Muscle band between outer torso and inner thoracic cavity
-    thoraxOuter = ((x/0.82).^2 + ((y+0.02)/0.98).^2) <= 1;
-    thoraxInner = ((x/0.64).^2 + ((y+0.02)/0.86).^2) <= 1;
-    muscleShell = thoraxOuter & ~thoraxInner;
-    labels(muscleShell) = LABEL.MUSCLE;
-
-    % Mediastinal soft tissue in the centre between the lungs
-    mediastinum = ((x/0.30).^2 + ((y+0.02)/0.95).^2) <= 1 & (x > -0.08);
-    labels(mediastinum) = LABEL.MUSCLE;
-
-    % Spine (posterior column)
-    spine = (abs(x) <= 0.08) & (((y+0.10)/0.88).^2 <= 1) & (y > -0.75);
-    labels(spine) = LABEL.BONE;
-
-    % Clavicles (superior bone bridges)
-    clavLeft  = ((x+0.45)/0.18).^2 + ((y+0.72)/0.06).^2 <= 1 & y < -0.58;
-    clavRight = ((x-0.45)/0.18).^2 + ((y+0.72)/0.06).^2 <= 1 & y < -0.58;
-    labels(clavLeft | clavRight) = LABEL.BONE;
-
-    % Ribs approximated as curved bone arcs wrapping the thorax
-    ribCenters = linspace(-0.20, 0.60, 5);
-    for k = 1:numel(ribCenters)
-        y0 = ribCenters(k);
-        outer = ((x/0.92).^2 + ((y - y0)/0.09).^2) <= 1;
-        inner = ((x/0.70).^2 + ((y - y0)/0.07).^2) <= 1;
-        rib = outer & ~inner & (y > y0-0.10) & (y < y0+0.18) & bodyOuter;
-        rib = rib & ~spine; % keep mediastinum clear
-        labels(rib) = LABEL.BONE;
-    end
-
-    % Superior airway (trachea) carved out of mediastinum
-    trachea = (abs(x+0.02) <= 0.05) & (y < -0.55) & (y > -0.95);
-    labels(trachea) = LABEL.AIR;
-
-    % Diaphragm curvature limiting inferior extent of the lungs
-    diaphragm = 0.60 + 0.06*cos(pi*x/1.7);
-
-    % Left lung (patient left / image right) with cardiac notch
-    lungL = (((x+0.30)/0.36).^2 + ((y+0.05)/0.78).^2) <= 1;
-    lungL = lungL & (x < 0.10) & (y <= diaphragm);
-    cardiacNotch = (((x+0.02)/0.20).^2 + ((y-0.02)/0.28).^2) <= 1 & (x > -0.15);
-    lungL = lungL & ~cardiacNotch;
-
-    % Right lung larger, spanning more inferiorly
-    lungR = (((x-0.22)/0.40).^2 + ((y+0.08)/0.82).^2) <= 1;
-    lungR = lungR & (x > -0.32) & (y <= diaphragm + 0.02);
-
-    % Hilum clearance near mediastinum
-    hilum = (abs(x) < 0.06) & (y > -0.25) & (y < 0.25);
-    lungL = lungL & ~hilum;
-    lungR = lungR & ~hilum;
-
-    lungs = (lungL | lungR) & bodyOuter;
+    L = E(cx-0.12*W, cy-0.02*H, 0.16*W, 0.24*H);
+    R = E(cx+0.12*W, cy-0.02*H, 0.16*W, 0.24*H);
+    lungs = L | R;
     labels(lungs) = LABEL.LUNG;
 
-    % Heart occupying mediastinum and intruding into left lung
-    heartUpper = (((x-0.02)/0.26).^2 + ((y+0.10)/0.28).^2) <= 1 & (y < 0.20);
-    heartLower = (abs(x-0.05) + 0.55*(y-0.05)) <= 0.38 & (y >= -0.10) & (y <= 0.45);
-    heart = (heartUpper | heartLower) & bodyOuter;
-    labels(heart) = LABEL.HEART;
-
-    % Ensure lungs do not include the heart or spine regions
-    lungs = (labels == LABEL.LUNG);
+    labels(E(cx,cy+0.06*H,0.10*W,0.12*H)) = LABEL.HEART; % heart
+    labels(E(cx,cy,       0.04*W,0.30*H)) = LABEL.BONE;  % spine
 end
 
 function [epsr, sigma, alpha] = assignProps(cfg, labels, lungs, LABEL)
@@ -226,7 +165,7 @@ function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
         turboMap = getTurboFallback(256);
     end
 
-    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone/Ribs'};
+    labNames = {'Air','Fat','Muscle','Lung','Heart','Spine'};
     labColors = [0.90 0.90 0.90;  % air
                  1.00 0.89 0.65;  % fat
                  0.80 0.10 0.10;  % muscle
