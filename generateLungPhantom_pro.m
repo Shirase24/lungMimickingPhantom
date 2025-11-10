@@ -99,11 +99,13 @@ function LABEL = defaultLabels()
 end
 
 function [labels, lungs] = buildLabelMap(cfg, LABEL)
-%BUILDLABELMAP Construct a simplified coronal tissue layout and lung mask.
-%   The phantom is intentionally coarse: fat outlines the torso, an inner
-%   muscular band surrounds the thoracic cavity, and the lungs/heart are
-%   captured with broad ellipses.  The reduced feature set keeps runtimes
-%   low while remaining deterministic for a given image size.
+%BUILDLABELMAP Create an axial soft-tissue cross-section with analytic shapes.
+%   The map emulates a transverse CT slice dominated by soft tissue. A
+%   circular fat contour surrounds a muscular ring, two smooth lung lobes sit
+%   anterior to the spine, and an elliptical heart overlaps the medial left
+%   lung.  The geometry is intentionally compact and symmetric to match the
+%   "soft tissue" appearance of the original release while remaining fully
+%   deterministic.
     H = cfg.H; W = cfg.W;
 
     % Normalized coordinate system (-1 .. 1) centered in the thorax
@@ -113,36 +115,34 @@ function [labels, lungs] = buildLabelMap(cfg, LABEL)
 
     labels = uint8(zeros(H, W) + LABEL.AIR);
 
-    % Soft-shouldered torso outline (fat layer)
-    torso = ((x/0.95).^2 + ((y+0.05)/1.05).^2) <= 1;
-    shoulderBlend = (((x/1.05).^4 + ((y+0.75)/0.50).^4) <= 1) & (y < -0.55);
-    body = torso | shoulderBlend;
-    labels(body) = LABEL.FAT;
+    % Torso: slightly flattened circle for subcutaneous fat
+    torso = ((x/0.95).^2 + ((y/0.90)).^2) <= 1;
+    labels(torso) = LABEL.FAT;
 
-    % Uniform muscular shell
-    thoraxOuter = ((x/0.82).^2 + ((y+0.02)/0.95).^2) <= 1;
-    thoraxInner = ((x/0.60).^2 + ((y+0.02)/0.78).^2) <= 1;
-    muscleBand = (thoraxOuter & body) & ~thoraxInner;
-    labels(muscleBand) = LABEL.MUSCLE;
+    % Muscular ring: thicker anteriorly to hint at pectoral muscles
+    thoraxOuter = ((x/0.78).^2 + ((y/0.82)).^2) <= 1;
+    thoraxInner = ((x/0.56).^2 + ((y/0.64)).^2) <= 1;
+    muscleBand = thoraxOuter & ~thoraxInner;
+    anteriorBoost = (y < 0.15);
+    labels(muscleBand | (thoraxOuter & anteriorBoost & torso)) = LABEL.MUSCLE;
 
-    % Simple sternum / anterior bone strip
-    sternum = body & (abs(x) <= 0.05) & (y > -0.50) & (y < 0.55);
-    labels(sternum) = LABEL.BONE;
-
-    % Dome-like diaphragm used to taper the lungs
-    diaphragm = 0.50 + 0.06 * (1 - cos(pi * x));
-
-    % Broad lung ellipses with light medial clearance
-    leftLung = (((x + 0.30)/0.40).^2 + ((y+0.05)/0.80).^2) <= 1;
-    rightLung = (((x - 0.28)/0.44).^2 + ((y+0.02)/0.82).^2) <= 1;
-    hilumGap = (abs(x) <= 0.08) & (y > -0.25) & (y < 0.35);
-    lungMask = (leftLung | rightLung) & ~hilumGap & (y <= diaphragm) & body;
+    % Dual-lobe lungs: symmetric ellipses trimmed posteriorly by the spine
+    leftLobe = (((x + 0.24)/0.34).^2 + ((y+0.05)/0.55).^2) <= 1;
+    rightLobe = (((x - 0.24)/0.36).^2 + ((y+0.02)/0.58).^2) <= 1;
+    midlineClearance = ((abs(x) <= 0.08) & (y > -0.25) & (y < 0.30));
+    posteriorTrim = (y > 0.45);
+    lungMask = (leftLobe | rightLobe) & ~midlineClearance & ~posteriorTrim;
+    lungMask = lungMask & thoraxOuter;
     labels(lungMask) = LABEL.LUNG;
 
-    % Elliptical heart partially overlapping the left lung
-    heart = (((x - 0.05)/0.22).^2 + ((y+0.05)/0.32).^2) <= 1;
-    heart = heart & body & (y > -0.25) & (y < 0.45);
+    % Elliptical heart nestled towards the left side
+    heart = (((x - 0.05)/0.20).^2 + ((y+0.03)/0.30).^2) <= 1;
+    heart = heart & thoraxOuter & (y > -0.20) & (y < 0.35);
     labels(heart) = LABEL.HEART;
+
+    % A soft spine hint (kept as muscle to maintain "soft tissue" look)
+    spine = (abs(x) <= 0.06) & thoraxOuter & (y > -0.10) & (y < 0.60);
+    labels(spine) = LABEL.MUSCLE;
 
     % Final lung mask excludes heart/other tissues
     lungs = (labels == LABEL.LUNG);
@@ -223,7 +223,7 @@ function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
         turboMap = getTurboFallback(256);
     end
 
-    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone/Sternum'};
+    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone (placeholder)'};
     labColors = [0.90 0.90 0.90;  % air
                  1.00 0.89 0.65;  % fat
                  0.80 0.10 0.10;  % muscle
