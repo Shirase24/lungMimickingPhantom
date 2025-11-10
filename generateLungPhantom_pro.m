@@ -80,7 +80,7 @@ function varargout = generateLungPhantom_pro(varargin)
 
     %% ---------------- ANIMATION (optional) ----------------
     if cfg.makeMP4
-        makeBreathingMP4(cfg, epsr, alpha, lungsMask);
+        makeBreathingFrames(cfg, epsr, alpha, lungsMask);
     end
 
     logmsg('--- Lung Phantom: done (%.3f s) ---', toc(t0));
@@ -252,33 +252,52 @@ function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
     set(gcf,'Color','w');
 end
 
-function makeBreathingMP4(cfg, epsr, alpha, lungs)
-%MAKEBREATHINGMP4 Synthesize a simple breathing animation if supported.
-    try
-        v = VideoWriter(fullfile(cfg.outDir,cfg.mp4Name),'MPEG-4');
-    catch
-        logmsg('(!) VideoWriter MPEG-4 not available on this MATLAB/OS. Skipping MP4.');
-        return;
+function makeBreathingFrames(cfg, epsr, alpha, lungs)
+%MAKEBREATHINGFRAMES Generate per-frame breathing animation images.
+%   Instead of compiling an MPEG-4 video (which is unavailable on some
+%   systems), this helper saves each animation frame to disk using the
+%   configured prefix/extension. Downstream tooling can assemble the frames
+%   into a video if desired, while the phantom pipeline remains fully
+%   reproducible with toolbox-free MATLAB functionality.
+
+    framesDir = char(fullfile(cfg.outDir, cfg.frameDir));
+    ensureDir(framesDir);
+
+    numFrames = max(1, round(cfg.mp4_seconds * cfg.mp4_fps));
+    t = linspace(0, cfg.mp4_seconds, numFrames);
+    bpm = cfg.mp4_bpm;
+    amp = cfg.mp4_amp;
+
+    eps_air = cfg.eps.AIR;
+    eps_par = cfg.eps.PARENCHYMA;
+
+    cmap = turboOrFallback(256);
+    prefix = char(cfg.framePrefix);
+    extStr = string(cfg.frameExt);
+    if ~startsWith(extStr, ".")
+        extStr = "." + extStr;
     end
-    v.FrameRate = cfg.mp4_fps; open(v);
-    t = linspace(0, cfg.mp4_seconds, cfg.mp4_seconds*cfg.mp4_fps);
-    bpm = cfg.mp4_bpm; amp = cfg.mp4_amp;
+    ext = char(extStr); % ensure char for sprintf compatibility
 
-    eps_air=cfg.eps.AIR; eps_par=cfg.eps.PARENCHYMA;
-
-    logmsg('MP4: rendering breathing animation ...');
-    for k=1:numel(t)
-        a = alpha .* (1 + amp*sin(2*pi*(bpm/60)*t(k)));
-        a = min(max(a,0),1);
+    logmsg('Frames: rendering breathing animation (%d frames) ...', numFrames);
+    for k = 1:numFrames
+        a = alpha .* (1 + amp * sin(2*pi*(bpm/60) * t(k)));
+        a = min(max(a, 0), 1);
         e = epsr;
-        e(lungs) = a(lungs).*eps_par + (1-a(lungs)).*eps_air;
+        e(lungs) = a(lungs) .* eps_par + (1 - a(lungs)) .* eps_air;
 
         im = mat2gray(e, cfg.range.epsr);
-        fr = ind2rgb(gray2ind(im,256), turboOrFallback(256));
-        writeVideo(v, im2frame(im2uint8(fr)));
+        fr = ind2rgb(gray2ind(im, 256), cmap);
+
+        frameName = sprintf('%s%0*d%s', prefix, cfg.frameDigits, k-1, ext);
+        framePath = char(fullfile(framesDir, frameName));
+        try
+            imwrite(im2uint8(fr), framePath);
+        catch ME
+            warning('Failed to write frame %s: %s', framePath, ME.message);
+        end
     end
-    close(v);
-    logmsg('MP4 saved -> %s', fullfile(cfg.outDir,cfg.mp4Name));
+    logmsg('Frames saved -> %s (%d files)', framesDir, numFrames);
 end
 
 %% ======================= UTILITIES =======================
@@ -305,8 +324,11 @@ function cfg = loadConfig(cfgInput)
     cfg.pngName = "phantom_epsr_sigma.png";
     cfg.matName = "phantom_data.mat";
     cfg.csvPrefix = "phantom_";
-    cfg.makeMP4 = true;
-    cfg.mp4Name = "phantom_breathing.mp4";
+    cfg.makeMP4 = true; % legacy flag retained for backward compatibility
+    cfg.frameDir = "phantom_frames";
+    cfg.framePrefix = "breath_";
+    cfg.frameExt = ".png";
+    cfg.frameDigits = 4;
     cfg.mp4_fps = 20; cfg.mp4_seconds = 6; cfg.mp4_bpm = 15; cfg.mp4_amp = 0.10;
 
     if nargin==0 || isempty(cfgInput)
@@ -357,11 +379,17 @@ function cfg = normalizeStrings(cfg)
     cfg.pngName = string(cfg.pngName);
     cfg.matName = string(cfg.matName);
     cfg.csvPrefix = string(cfg.csvPrefix);
-    cfg.mp4Name = string(cfg.mp4Name);
+    cfg.frameDir = string(cfg.frameDir);
+    cfg.framePrefix = string(cfg.framePrefix);
+    cfg.frameExt = string(cfg.frameExt);
+    if ~startsWith(cfg.frameExt, ".")
+        cfg.frameExt = "." + cfg.frameExt;
+    end
 end
 
 function ensureDir(p)
 %ENSUREDIR Create output directory if it does not exist.
+    p = char(p);
     if ~exist(p,'dir')
         ok = mkdir(p);
         if ~ok, error('Failed to create output dir: %s', p); end

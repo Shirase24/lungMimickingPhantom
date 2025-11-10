@@ -10,6 +10,14 @@ classdef TestPhantom < matlab.unittest.TestCase
             testCase.verifyEqual(cfg.outDir, "custom_out");
         end
 
+        function testAnimationFrameConfig(testCase)
+            cfg = generateLungPhantom_pro('__private__','loadConfig', struct('frameExt','png'));
+            testCase.verifyTrue(cfg.makeMP4); % legacy flag remains
+            testCase.verifyEqual(cfg.frameExt, ".png");
+            testCase.verifyClass(cfg.frameDir, "string");
+            testCase.verifyGreaterThan(cfg.frameDigits, 0);
+        end
+
         function testBuildLabelMapLungMask(testCase)
             cfg = generateLungPhantom_pro('__private__','loadConfig', []);
             LABEL = generateLungPhantom_pro('__private__','defaultLabels');
