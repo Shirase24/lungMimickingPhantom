@@ -5,8 +5,35 @@
 %  Target: Simulation pipelines (openEMS/CST/MEEP/gprMax) + teaching demos
 % ========================================================================
 
-function generateLungPhantom_pro
-    %GENERATELUNGPHANTOM_PRO Build and export a heterogeneous 2D lung phantom.
+function varargout = generateLungPhantom_pro(varargin)
+%GENERATELUNGPHANTOM_PRO Build and export a heterogeneous 2D lung phantom.
+%   generateLungPhantom_pro() produces the same artefacts as previous
+%   versions but now accepts optional configuration overrides via structs or
+%   JSON strings/files. Unit tests can reach private helpers through the
+%   '__private__' escape hatch implemented below, avoiding duplicate files
+%   while keeping the external API intact.
+
+    persistent PRIVATES
+    if isempty(PRIVATES)
+        PRIVATES = localfunctions; %#ok<SETNU>
+    end
+
+    % Allow unit tests to reach private helpers without exposing them as
+    % separate files. Usage:
+    %   generateLungPhantom_pro('__private__','buildLabelMap',cfg,LABEL)
+    if nargin>0 && ischar(varargin{1}) && strcmp(varargin{1},'__private__')
+        if numel(varargin) < 2
+            error('Private dispatch requires a function name argument.');
+        end
+        target = char(varargin{2});
+        if ~isfield(PRIVATES, target)
+            error('Unknown private function requested: %s', string(target));
+        end
+        fh = PRIVATES.(target);
+        [varargout{1:nargout}] = fh(varargin{3:end});
+        return;
+    end
+
     %   This script creates a label map with simple analytic shapes that mimic
     %   thoracic anatomy, assigns nominal electrical properties, produces
     %   visualizations, exports data products, and can synthesize a breathing
@@ -16,39 +43,17 @@ function generateLungPhantom_pro
     t0 = tic; logmsg('--- Lung Phantom: start ---');
 
     %% ---------------- CONFIG (edit here) ----------------
-    cfg = struct();
-    cfg.H = 256;                  % image height  (pixels)
-    cfg.W = 256;                  % image width   (pixels)
-    cfg.freqGHz = 1.0;            % (metadata only)
-    cfg.seed = 123;               % RNG seed for reproducibility
+    cfgInput = [];
+    if ~isempty(varargin)
+        cfgInput = varargin{1};
+    end
 
-    % Electrical props (~1 GHz placeholders; replace with literature when needed)
-    cfg.eps = struct('AIR',1.0006,'FAT',5.0,'MUSCLE',52.0,'LUNG',20.0,'HEART',60.0,'BONE',12.0,'PARENCHYMA',25.0);
-    cfg.sig = struct('AIR',0.00,  'FAT',0.05,'MUSCLE',0.80,'LUNG',0.40,'HEART',1.00,'BONE',0.20,'PARENCHYMA',0.60);
-
-    % Heterogeneity (lung texture) parameters
-    cfg.alpha = struct('min',0.35,'max',0.70,'sigma_px',6,'boost',1.00);
-
-    % Visualization ranges (keep consistent across runs)
-    cfg.range = struct('epsr',[1 65],'sigma',[0 1.2]);
-
-    % Lesion example (set radius<=0 to disable)
-    cfg.lesion = struct('enable',true,'relRadius',0.08,'centerOffset',[0.18 -0.05], ...
-                        'epsrFactor',1.35,'sigmaFactor',1.45);
-
-    % Output
-    cfg.outDir  = "output_phantom";
-    cfg.pngName = "phantom_epsr_sigma.png";
-    cfg.matName = "phantom_data.mat";
-    cfg.csvPrefix = "phantom_";
-    cfg.makeMP4 = true;           % breathing animation
-    cfg.mp4Name = "phantom_breathing.mp4";
-    cfg.mp4_fps = 20; cfg.mp4_seconds = 6; cfg.mp4_bpm = 15; cfg.mp4_amp = 0.10;
+    cfg = loadConfig(cfgInput);
 
     rng(cfg.seed);
 
     % Labels
-    LABEL = struct('AIR',0,'FAT',1,'MUSCLE',2,'LUNG',3,'HEART',4,'BONE',5);
+    LABEL = defaultLabels();
 
     % Validate config
     mustBeScalarPosInt(cfg.H,'cfg.H');
@@ -79,11 +84,26 @@ function generateLungPhantom_pro
     end
 
     logmsg('--- Lung Phantom: done (%.3f s) ---', toc(t0));
+
+    if nargout>0
+        outputs = {labels, epsr, sigma, alpha, cfg};
+        varargout = outputs(1:nargout);
+    end
 end
 
 %% ======================= CORE FUNCTIONS =======================
 
+function LABEL = defaultLabels()
+%DEFAULTLABELS Canonical mapping between tissue names and label IDs.
+    LABEL = struct('AIR',0,'FAT',1,'MUSCLE',2,'LUNG',3,'HEART',4,'BONE',5);
+end
+
 function [labels, lungs] = buildLabelMap(cfg, LABEL)
+%BUILDLABELMAP Construct coronal-view tissue labels and lung mask.
+%   The geometry is described analytically to avoid raster loops.  Shoulders,
+%   chest wall, mediastinum, lungs, heart, and skeletal features are all
+%   procedurally modelled using level-sets, keeping the output deterministic
+%   for a given image size.
     H = cfg.H; W = cfg.W;
 
     % Normalized coordinate system (-1 .. 1) centered in the thorax
@@ -123,15 +143,13 @@ function [labels, lungs] = buildLabelMap(cfg, LABEL)
     labels(clavLeft | clavRight) = LABEL.BONE;
 
     % Anterior ribs rendered as horizontal bands curving away from the sternum
-    ribHeights = linspace(-0.20, 0.58, 7);
-    for k = 1:numel(ribHeights)
-        y0 = ribHeights(k);
-        ribBand = abs(y - y0) <= 0.025;
-        ribShape = ((x/0.88).^2 + ((y - y0)/0.16).^2) <= 1 & ((x/0.58).^2 + ((y - y0)/0.12).^2) >= 1;
-        rib = ribBand & ribShape & bodyOuter & (abs(x) >= 0.12);
-        rib = rib & (y < 0.70) & (y > -0.40);
-        labels(rib) = LABEL.BONE;
-    end
+    ribHeights = reshape(linspace(-0.20, 0.58, 7), 1, 1, []);
+    ribBand = abs(y - ribHeights) <= 0.025;
+    ribOuter = ((x/0.88).^2 + ((y - ribHeights)/0.16).^2) <= 1;
+    ribInner = ((x/0.58).^2 + ((y - ribHeights)/0.12).^2) >= 1;
+    ribs = any(ribBand & ribOuter & ribInner, 3) & bodyOuter & (abs(x) >= 0.12);
+    ribs = ribs & (y < 0.70) & (y > -0.40);
+    labels(ribs) = LABEL.BONE;
 
     % Trachea and central airway (air column)
     trachea = (abs(x+0.02) <= 0.045) & (y < -0.58) & (y > -0.98);
@@ -172,25 +190,34 @@ function [labels, lungs] = buildLabelMap(cfg, LABEL)
 end
 
 function [epsr, sigma, alpha] = assignProps(cfg, labels, lungs, LABEL)
-    % Base property assignment
-    H=cfg.H; W=cfg.W; epsr=zeros(H,W); sigma=zeros(H,W);
-    tissueOrder = {'AIR','FAT','MUSCLE','LUNG','HEART','BONE'};
-    for k = 1:numel(tissueOrder)
-        key = tissueOrder{k};
-        valEps = cfg.eps.(key);
-        valSig = cfg.sig.(key);
-        mask = labels == LABEL.(key);
-        epsr(mask) = valEps;
-        sigma(mask) = valSig;
+%ASSIGNPROPS Map tissue labels to dielectric properties with lung heterogeneity.
+%   Vectorised lookups avoid per-label loops while preserving determinism.
+    H = cfg.H; W = cfg.W;
+
+    maxLabel = max(struct2array(LABEL));
+    epsLookup = zeros(1, maxLabel+1);
+    sigLookup = zeros(1, maxLabel+1);
+
+    fields = fieldnames(LABEL);
+    for k = 1:numel(fields)
+        key = fields{k};
+        idx = LABEL.(key) + 1; % labels start at zero
+        epsLookup(idx) = cfg.eps.(key);
+        sigLookup(idx) = cfg.sig.(key);
     end
+
+    labelsIdx = double(labels) + 1;
+    epsr = reshape(epsLookup(labelsIdx), H, W);
+    sigma = reshape(sigLookup(labelsIdx), H, W);
 
     % Heterogeneity field alpha (0..1) only in lungs
     n = smooth2(randn(H,W), cfg.alpha.sigma_px);
-    n = (n - min(n(:)));
-    if max(n(:)) > 0
-        n = n / max(n(:));
+    n = n - min(n(:));
+    rangeN = max(n(:));
+    if rangeN > 0
+        n = n / rangeN;
     end
-    alpha = (cfg.alpha.min + (cfg.alpha.max-cfg.alpha.min)*n) * cfg.alpha.boost;
+    alpha = (cfg.alpha.min + (cfg.alpha.max - cfg.alpha.min) * n) * cfg.alpha.boost;
     alpha = min(max(alpha,0),1);
     alpha(~lungs) = 0;
 
@@ -202,6 +229,7 @@ function [epsr, sigma, alpha] = assignProps(cfg, labels, lungs, LABEL)
 end
 
 function [epsr,sigma] = addDefaultLesion(cfg, epsr, sigma, lungs)
+%ADDDEFAULTLESION Inject a simple lesion into the right lung if configured.
     if ~isfield(cfg,'lesion') || isempty(cfg.lesion) || ~cfg.lesion.enable
         return;
     end
@@ -229,6 +257,7 @@ function [epsr,sigma] = addDefaultLesion(cfg, epsr, sigma, lungs)
 end
 
 function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
+%PLOTCLEAN Render the label map, permittivity, and conductivity side-by-side.
     if exist('turbo','file') == 2
         turboMap = turbo(256);
     else
@@ -265,6 +294,7 @@ function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
 end
 
 function makeBreathingMP4(cfg, epsr, alpha, lungs)
+%MAKEBREATHINGMP4 Synthesize a simple breathing animation if supported.
     try
         v = VideoWriter(fullfile(cfg.outDir,cfg.mp4Name),'MPEG-4');
     catch
@@ -294,7 +324,85 @@ end
 
 %% ======================= UTILITIES =======================
 
+function cfg = loadConfig(cfgInput)
+%LOADCONFIG Build runtime configuration from defaults and optional overrides.
+%   cfgInput may be empty, a struct, a JSON string, or a path to a JSON file.
+    cfg = struct();
+    cfg.H = 256;
+    cfg.W = 256;
+    cfg.freqGHz = 1.0;
+    cfg.seed = 123;
+
+    cfg.eps = struct('AIR',1.0006,'FAT',5.0,'MUSCLE',52.0,'LUNG',20.0,'HEART',60.0,'BONE',12.0,'PARENCHYMA',25.0);
+    cfg.sig = struct('AIR',0.00,'FAT',0.05,'MUSCLE',0.80,'LUNG',0.40,'HEART',1.00,'BONE',0.20,'PARENCHYMA',0.60);
+
+    cfg.alpha = struct('min',0.35,'max',0.70,'sigma_px',6,'boost',1.00);
+    cfg.range = struct('epsr',[1 65],'sigma',[0 1.2]);
+
+    cfg.lesion = struct('enable',true,'relRadius',0.08,'centerOffset',[0.18 -0.05], ...
+                        'epsrFactor',1.35,'sigmaFactor',1.45);
+
+    cfg.outDir = "output_phantom";
+    cfg.pngName = "phantom_epsr_sigma.png";
+    cfg.matName = "phantom_data.mat";
+    cfg.csvPrefix = "phantom_";
+    cfg.makeMP4 = true;
+    cfg.mp4Name = "phantom_breathing.mp4";
+    cfg.mp4_fps = 20; cfg.mp4_seconds = 6; cfg.mp4_bpm = 15; cfg.mp4_amp = 0.10;
+
+    if nargin==0 || isempty(cfgInput)
+        cfg = normalizeStrings(cfg);
+        return;
+    end
+
+    if isstruct(cfgInput)
+        cfg = mergeStructs(cfg, cfgInput);
+    elseif isstring(cfgInput) || ischar(cfgInput)
+        txt = char(cfgInput);
+        if exist(txt,'file') == 2
+            txt = fileread(txt);
+        end
+        data = jsondecode(txt);
+        if ~isstruct(data)
+            error('JSON configuration must decode to a struct.');
+        end
+        cfg = mergeStructs(cfg, data);
+    else
+        error('Unsupported configuration input type: %s', class(cfgInput));
+    end
+
+    cfg = normalizeStrings(cfg);
+end
+
+function out = mergeStructs(base, override)
+%MERGESTRUCTS Recursively merge override struct values into base struct.
+    out = base;
+    if isempty(override)
+        return;
+    end
+    fields = fieldnames(override);
+    for k = 1:numel(fields)
+        name = fields{k};
+        val = override.(name);
+        if isfield(base, name) && isstruct(base.(name)) && isstruct(val)
+            out.(name) = mergeStructs(base.(name), val);
+        else
+            out.(name) = val;
+        end
+    end
+end
+
+function cfg = normalizeStrings(cfg)
+%NORMALIZESTRINGS Ensure string-valued paths remain MATLAB strings.
+    cfg.outDir = string(cfg.outDir);
+    cfg.pngName = string(cfg.pngName);
+    cfg.matName = string(cfg.matName);
+    cfg.csvPrefix = string(cfg.csvPrefix);
+    cfg.mp4Name = string(cfg.mp4Name);
+end
+
 function ensureDir(p)
+%ENSUREDIR Create output directory if it does not exist.
     if ~exist(p,'dir')
         ok = mkdir(p);
         if ~ok, error('Failed to create output dir: %s', p); end
@@ -302,18 +410,21 @@ function ensureDir(p)
 end
 
 function mustBeScalarPosInt(x, name)
+%MUSTBESCALARPOSINT Validate positive integer scalar inputs.
     if ~(isscalar(x) && isnumeric(x) && x>0 && mod(x,1)==0)
         error('%s must be a positive integer scalar.', name);
     end
 end
 
 function mustBeRange(r, name)
+%MUSTBERANGE Validate [min max] numeric ranges.
     if ~(isnumeric(r) && numel(r)==2 && r(1)<r(2))
         error('%s must be a 1x2 numeric [min max] with min<max.', name);
     end
 end
 
 function safeExportPNG(fig, filename, dpi)
+%SAFEEXPORTPNG Robust PNG export with fallback to PRINT on failure.
     try
         exportgraphics(fig, filename, 'Resolution', dpi);
         logmsg('PNG saved -> %s', filename);
@@ -329,6 +440,7 @@ function safeExportPNG(fig, filename, dpi)
 end
 
 function safeSave(matFile, labels, epsr, sigma, alpha, cfg)
+%SAFESAVE Store phantom artefacts to MAT-file with compatibility fallback.
     try
         save(matFile,'labels','epsr','sigma','alpha','cfg','-v7.3');
         logmsg('MAT saved -> %s', matFile);
@@ -344,6 +456,7 @@ function safeSave(matFile, labels, epsr, sigma, alpha, cfg)
 end
 
 function safeWriteCSV(path, A)
+%SAFEWRITECSV Write numeric matrices to CSV with available toolbox.
     try
         if exist('writematrix','file') == 2
             writematrix(A, path);
@@ -357,7 +470,7 @@ function safeWriteCSV(path, A)
 end
 
 function S = smooth2(A, sigma_px)
-    % Gaussian-like separable blur (toolbox-free)
+%SMOOTH2 Gaussian-like separable blur (toolbox-free).
     if sigma_px<=0, S=A; return; end
     r = max(1, ceil(3*sigma_px));
     x = -r:r; g = exp(-(x.^2)/(2*sigma_px^2)); g = g/sum(g);
@@ -365,10 +478,12 @@ function S = smooth2(A, sigma_px)
 end
 
 function logmsg(fmt, varargin)
+%LOGMSG Timestamped logging helper.
     fprintf('%s  %s\n', datestr(now,'HH:MM:SS'), sprintf(fmt, varargin{:}));
 end
 
 function cmap = turboOrFallback(n)
+%TURBOORFALLBACK Use MATLAB's turbo colormap or the local approximation.
     if exist('turbo','file') == 2
         cmap = turbo(n);
     else
@@ -377,8 +492,7 @@ function cmap = turboOrFallback(n)
 end
 
 function cmap = getTurboFallback(n)
-    % Approximate turbo colormap coefficients (MATLAB File Exchange variant)
-    % Reference: Anton Semechko, 2020 (public domain approximation)
+%GETTURBOFALLBACK Approximate the turbo colormap (Anton Semechko, 2020).
     t = linspace(0,1,n)';
     r = 0.135 - 0.13*t + 0.645*t.^2 + 0.365*t.^3 - 1.17*t.^4 + 0.725*t.^5;
     g = 0.12  + 0.885*t - 0.305*t.^2 - 1.8*t.^3 + 2.77*t.^4 - 1.3*t.^5;
