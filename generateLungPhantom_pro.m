@@ -1,11 +1,17 @@
 %% =======================================================================
 %  generateLungPhantom_pro.m
 %  Developer-grade 2D Lung Phantom Generator (toolbox-free, error-handled)
-%  Author: (Your Name)   Version: 4.0
+%  Author: OpenAI ChatGPT (auto-generated)
 %  Target: Simulation pipelines (openEMS/CST/MEEP/gprMax) + teaching demos
 % ========================================================================
 
 function generateLungPhantom_pro
+    %GENERATELUNGPHANTOM_PRO Build and export a heterogeneous 2D lung phantom.
+    %   This script creates a label map with simple analytic shapes that mimic
+    %   thoracic anatomy, assigns nominal electrical properties, produces
+    %   visualizations, exports data products, and can synthesize a breathing
+    %   animation. All dependencies are available in base MATLAB.
+
     clc; close all;
     t0 = tic; logmsg('--- Lung Phantom: start ---');
 
@@ -13,7 +19,7 @@ function generateLungPhantom_pro
     cfg = struct();
     cfg.H = 256;                  % image height  (pixels)
     cfg.W = 256;                  % image width   (pixels)
-    cfg.freqGHz = 1.0;            % (meta only)
+    cfg.freqGHz = 1.0;            % (metadata only)
     cfg.seed = 123;               % RNG seed for reproducibility
 
     % Electrical props (~1 GHz placeholders; replace with literature when needed)
@@ -25,6 +31,10 @@ function generateLungPhantom_pro
 
     % Visualization ranges (keep consistent across runs)
     cfg.range = struct('epsr',[1 65],'sigma',[0 1.2]);
+
+    % Lesion example (set radius<=0 to disable)
+    cfg.lesion = struct('enable',true,'relRadius',0.08,'centerOffset',[0.18 -0.05], ...
+                        'epsrFactor',1.35,'sigmaFactor',1.45);
 
     % Output
     cfg.outDir  = "output_phantom";
@@ -55,7 +65,7 @@ function generateLungPhantom_pro
     [epsr, sigma] = addDefaultLesion(cfg, epsr, sigma, lungsMask);
 
     %% ---------------- VISUALIZE + SAVE ----------------
-    fig = plotClean(cfg, labels, epsr, sigma);
+    fig = plotClean(cfg, labels, epsr, sigma, LABEL);
     safeExportPNG(fig, fullfile(cfg.outDir,cfg.pngName), 220);
 
     safeSave(fullfile(cfg.outDir,cfg.matName), labels, epsr, sigma, alpha, cfg);
@@ -74,40 +84,105 @@ end
 %% ======================= CORE FUNCTIONS =======================
 
 function [labels, lungs] = buildLabelMap(cfg, LABEL)
-    H=cfg.H; W=cfg.W;
-    [dx,dy]=meshgrid(1:W,1:H); cx=W/2; cy=H/2;
-    E=@(xc,yc,a,b) (((dx-xc)./a).^2 + ((dy-yc)./b).^2) <= 1;
+    H = cfg.H; W = cfg.W;
 
-    labels = uint8(zeros(H,W) + LABEL.AIR);
-    labels(E(cx,cy,0.35*W,0.45*H)) = LABEL.FAT;      % subcutaneous fat
-    labels(E(cx,cy,0.33*W,0.42*H)) = LABEL.MUSCLE;   % muscle shell
+    % Normalized coordinate system (-1 .. 1) centered in the thorax
+    [xIdx, yIdx] = meshgrid(1:W, 1:H);
+    x = (xIdx - (W+1)/2) / (W/2);
+    y = (yIdx - (H+1)/2) / (H/2);
 
-    L = E(cx-0.12*W, cy-0.02*H, 0.16*W, 0.24*H);
-    R = E(cx+0.12*W, cy-0.02*H, 0.16*W, 0.24*H);
-    lungs = L | R;
+    labels = uint8(zeros(H, W) + LABEL.AIR);
+
+    % Body contour and subcutaneous fat layer (elliptical torso)
+    bodyOuter = ((x/0.95).^2 + ((y+0.05)/1.05).^2) <= 1;
+    labels(bodyOuter) = LABEL.FAT;
+
+    % Muscle band between outer torso and inner thoracic cavity
+    thoraxOuter = ((x/0.82).^2 + ((y+0.02)/0.98).^2) <= 1;
+    thoraxInner = ((x/0.64).^2 + ((y+0.02)/0.86).^2) <= 1;
+    muscleShell = thoraxOuter & ~thoraxInner;
+    labels(muscleShell) = LABEL.MUSCLE;
+
+    % Mediastinal soft tissue in the centre between the lungs
+    mediastinum = ((x/0.30).^2 + ((y+0.02)/0.95).^2) <= 1 & (x > -0.08);
+    labels(mediastinum) = LABEL.MUSCLE;
+
+    % Spine (posterior column)
+    spine = (abs(x) <= 0.08) & (((y+0.10)/0.88).^2 <= 1) & (y > -0.75);
+    labels(spine) = LABEL.BONE;
+
+    % Clavicles (superior bone bridges)
+    clavLeft  = ((x+0.45)/0.18).^2 + ((y+0.72)/0.06).^2 <= 1 & y < -0.58;
+    clavRight = ((x-0.45)/0.18).^2 + ((y+0.72)/0.06).^2 <= 1 & y < -0.58;
+    labels(clavLeft | clavRight) = LABEL.BONE;
+
+    % Ribs approximated as curved bone arcs wrapping the thorax
+    ribCenters = linspace(-0.20, 0.60, 5);
+    for k = 1:numel(ribCenters)
+        y0 = ribCenters(k);
+        outer = ((x/0.92).^2 + ((y - y0)/0.09).^2) <= 1;
+        inner = ((x/0.70).^2 + ((y - y0)/0.07).^2) <= 1;
+        rib = outer & ~inner & (y > y0-0.10) & (y < y0+0.18) & bodyOuter;
+        rib = rib & ~spine; % keep mediastinum clear
+        labels(rib) = LABEL.BONE;
+    end
+
+    % Superior airway (trachea) carved out of mediastinum
+    trachea = (abs(x+0.02) <= 0.05) & (y < -0.55) & (y > -0.95);
+    labels(trachea) = LABEL.AIR;
+
+    % Diaphragm curvature limiting inferior extent of the lungs
+    diaphragm = 0.60 + 0.06*cos(pi*x/1.7);
+
+    % Left lung (patient left / image right) with cardiac notch
+    lungL = (((x+0.30)/0.36).^2 + ((y+0.05)/0.78).^2) <= 1;
+    lungL = lungL & (x < 0.10) & (y <= diaphragm);
+    cardiacNotch = (((x+0.02)/0.20).^2 + ((y-0.02)/0.28).^2) <= 1 & (x > -0.15);
+    lungL = lungL & ~cardiacNotch;
+
+    % Right lung larger, spanning more inferiorly
+    lungR = (((x-0.22)/0.40).^2 + ((y+0.08)/0.82).^2) <= 1;
+    lungR = lungR & (x > -0.32) & (y <= diaphragm + 0.02);
+
+    % Hilum clearance near mediastinum
+    hilum = (abs(x) < 0.06) & (y > -0.25) & (y < 0.25);
+    lungL = lungL & ~hilum;
+    lungR = lungR & ~hilum;
+
+    lungs = (lungL | lungR) & bodyOuter;
     labels(lungs) = LABEL.LUNG;
 
-    labels(E(cx,cy+0.06*H,0.10*W,0.12*H)) = LABEL.HEART; % heart
-    labels(E(cx,cy,       0.04*W,0.30*H)) = LABEL.BONE;  % spine
+    % Heart occupying mediastinum and intruding into left lung
+    heartUpper = (((x-0.02)/0.26).^2 + ((y+0.10)/0.28).^2) <= 1 & (y < 0.20);
+    heartLower = (abs(x-0.05) + 0.55*(y-0.05)) <= 0.38 & (y >= -0.10) & (y <= 0.45);
+    heart = (heartUpper | heartLower) & bodyOuter;
+    labels(heart) = LABEL.HEART;
+
+    % Ensure lungs do not include the heart or spine regions
+    lungs = (labels == LABEL.LUNG);
 end
 
 function [epsr, sigma, alpha] = assignProps(cfg, labels, lungs, LABEL)
     % Base property assignment
     H=cfg.H; W=cfg.W; epsr=zeros(H,W); sigma=zeros(H,W);
-    map = {@(id,eps,sig) setMask(id,eps,sig,'AIR',cfg,labels);
-           @(id,eps,sig) setMask(id,eps,sig,'FAT',cfg,labels);
-           @(id,eps,sig) setMask(id,eps,sig,'MUSCLE',cfg,labels);
-           @(id,eps,sig) setMask(id,eps,sig,'LUNG',cfg,labels);
-           @(id,eps,sig) setMask(id,eps,sig,'HEART',cfg,labels);
-           @(id,eps,sig) setMask(id,eps,sig,'BONE',cfg,labels)};
-    for i=1:numel(map)
-        [epsr,sigma] = map{i}(struct('epsr',epsr,'sigma',sigma), cfg.eps, cfg.sig);
+    tissueOrder = {'AIR','FAT','MUSCLE','LUNG','HEART','BONE'};
+    for k = 1:numel(tissueOrder)
+        key = tissueOrder{k};
+        valEps = cfg.eps.(key);
+        valSig = cfg.sig.(key);
+        mask = labels == LABEL.(key);
+        epsr(mask) = valEps;
+        sigma(mask) = valSig;
     end
 
     % Heterogeneity field alpha (0..1) only in lungs
     n = smooth2(randn(H,W), cfg.alpha.sigma_px);
-    n = (n - min(n(:))) / max(n(:));                 % normalize
+    n = (n - min(n(:)));
+    if max(n(:)) > 0
+        n = n / max(n(:));
+    end
     alpha = (cfg.alpha.min + (cfg.alpha.max-cfg.alpha.min)*n) * cfg.alpha.boost;
+    alpha = min(max(alpha,0),1);
     alpha(~lungs) = 0;
 
     % Blend lungs between air and parenchyma
@@ -117,44 +192,48 @@ function [epsr, sigma, alpha] = assignProps(cfg, labels, lungs, LABEL)
     sigma(lungs) = alpha(lungs).*sig_par + (1-alpha(lungs)).*sig_air;
 end
 
-function [epsr,sigma] = setMask(io, epsTbl, sigTbl, key, cfg, labels)
-    % Helper to assign one label's base epsr/sigma
-    labVal = getfield(epsTbl, key); %#ok<GFLD>
-    sigVal = getfield(sigTbl, key); %#ok<GFLD>
-    switch key
-        case 'AIR',    mask = (labels==0);
-        case 'FAT',    mask = (labels==1);
-        case 'MUSCLE', mask = (labels==2);
-        case 'LUNG',   mask = (labels==3);
-        case 'HEART',  mask = (labels==4);
-        case 'BONE',   mask = (labels==5);
-        otherwise,     mask = false(size(labels));
+function [epsr,sigma] = addDefaultLesion(cfg, epsr, sigma, lungs)
+    if ~isfield(cfg,'lesion') || isempty(cfg.lesion) || ~cfg.lesion.enable
+        return;
     end
-    io.epsr(mask) = labVal;
-    io.sigma(mask)= sigVal;
-    epsr = io.epsr; sigma = io.sigma;
+
+    radius = max(1, round(cfg.lesion.relRadius * min(cfg.H,cfg.W)));
+    if radius <= 0
+        return;
+    end
+
+    [X,Y] = meshgrid(1:cfg.W,1:cfg.H);
+    cx = cfg.W/2 + cfg.lesion.centerOffset(1)*cfg.W;
+    cy = cfg.H/2 + cfg.lesion.centerOffset(2)*cfg.H;
+    lesionMask = ((X-cx).^2 + (Y-cy).^2) <= radius^2;
+    lesionMask = lesionMask & lungs;
+    if ~any(lesionMask(:))
+        logmsg('Lesion mask empty; skipping default lesion.');
+        return;
+    end
+
+    lungEps = cfg.eps.PARENCHYMA;
+    lungSig = cfg.sig.PARENCHYMA;
+    epsr(lesionMask) = lungEps * cfg.lesion.epsrFactor;
+    sigma(lesionMask) = lungSig * cfg.lesion.sigmaFactor;
+    logmsg('Lesion injected: radius=%d px, epsr x%.2f, sigma x%.2f', radius, cfg.lesion.epsrFactor, cfg.lesion.sigmaFactor);
 end
 
-function [epsr, sigma] = addDefaultLesion(cfg, epsr, sigma, lungs)
-    % One sample lesion inside right lung (higher water content)
-    [dx,dy]=meshgrid(1:cfg.W,1:cfg.H);
-    cx=cfg.W/2; cy=cfg.H/2;
-    mask = (dx-(cx+0.07*cfg.W)).^2 + (dy-(cy-0.05*cfg.H)).^2 <= (0.06*cfg.W)^2;
-    mask = mask & lungs;
-    epsr(mask)=45.0; sigma(mask)=0.9;
-end
+function fig = plotClean(cfg, labels, epsr, sigma, LABEL)
+    if exist('turbo','file') == 2
+        turboMap = turbo(256);
+    else
+        turboMap = getTurboFallback(256);
+    end
 
-function fig = plotClean(cfg, labels, epsr, sigma)
-    % Discrete label colormap
-    labCmap = [
-        0.12 0.16 0.45;  % Air
-        0.96 0.86 0.56;  % Fat
-        0.96 0.58 0.25;  % Muscle
-        0.50 0.80 0.78;  % Lung
-        0.90 0.25 0.28;  % Heart
-        0.95 0.90 0.25   % Bone
-    ];
-    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone'};
+    labNames = {'Air','Fat','Muscle','Lung','Heart','Bone/Ribs'};
+    labColors = [0.90 0.90 0.90;  % air
+                 1.00 0.89 0.65;  % fat
+                 0.80 0.10 0.10;  % muscle
+                 0.50 0.80 0.85;  % lung
+                 0.80 0.20 0.50;  % heart
+                 0.65 0.65 0.65]; % bone/spine
+    labCmap = interp1(1:size(labColors,1), labColors, linspace(1,size(labColors,1),256));
 
     fig = figure('Name','Lung Phantom','Position',[120 120 1220 420]);
     tiledlayout(1,3,'Padding','compact','TileSpacing','compact');
@@ -167,7 +246,7 @@ function fig = plotClean(cfg, labels, epsr, sigma)
 
     % 2) Permittivity
     nexttile; imagesc(epsr, cfg.range.epsr); axis image off;
-    colormap(gca, turbo(256)); colorbar; title('\epsilon_r @ 1 GHz','FontWeight','bold');
+    colormap(gca, turboMap); colorbar; title('\epsilon_r @ 1 GHz','FontWeight','bold');
 
     % 3) Conductivity
     nexttile; imagesc(sigma, cfg.range.sigma); axis image off;
@@ -180,7 +259,7 @@ function makeBreathingMP4(cfg, epsr, alpha, lungs)
     try
         v = VideoWriter(fullfile(cfg.outDir,cfg.mp4Name),'MPEG-4');
     catch
-        logmsg('(!) VideoWriter MPEG-4 not available on this MATLAB/OS. Skipping MP4.'); 
+        logmsg('(!) VideoWriter MPEG-4 not available on this MATLAB/OS. Skipping MP4.');
         return;
     end
     v.FrameRate = cfg.mp4_fps; open(v);
@@ -192,11 +271,12 @@ function makeBreathingMP4(cfg, epsr, alpha, lungs)
     logmsg('MP4: rendering breathing animation ...');
     for k=1:numel(t)
         a = alpha .* (1 + amp*sin(2*pi*(bpm/60)*t(k)));
+        a = min(max(a,0),1);
         e = epsr;
         e(lungs) = a(lungs).*eps_par + (1-a(lungs)).*eps_air;
 
         im = mat2gray(e, cfg.range.epsr);
-        fr = ind2rgb(gray2ind(im,256), turbo(256));
+        fr = ind2rgb(gray2ind(im,256), turboOrFallback(256));
         writeVideo(v, im2frame(im2uint8(fr)));
     end
     close(v);
@@ -278,3 +358,22 @@ end
 function logmsg(fmt, varargin)
     fprintf('%s  %s\n', datestr(now,'HH:MM:SS'), sprintf(fmt, varargin{:}));
 end
+
+function cmap = turboOrFallback(n)
+    if exist('turbo','file') == 2
+        cmap = turbo(n);
+    else
+        cmap = getTurboFallback(n);
+    end
+end
+
+function cmap = getTurboFallback(n)
+    % Approximate turbo colormap coefficients (MATLAB File Exchange variant)
+    % Reference: Anton Semechko, 2020 (public domain approximation)
+    t = linspace(0,1,n)';
+    r = 0.135 - 0.13*t + 0.645*t.^2 + 0.365*t.^3 - 1.17*t.^4 + 0.725*t.^5;
+    g = 0.12  + 0.885*t - 0.305*t.^2 - 1.8*t.^3 + 2.77*t.^4 - 1.3*t.^5;
+    b = 0.45  + 0.17*t - 1.6*t.^2 + 2.31*t.^3 - 1.5*t.^4 + 0.34*t.^5;
+    cmap = max(min([r g b],1),0);
+end
+
